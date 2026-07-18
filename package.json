@@ -1,0 +1,29 @@
+{
+  "name": "xiaoshuo-cli",
+  "version": "1.0.0",
+  "description": "CLI 入口 — 基于 TvTink/xiaoshuo 的命令行长篇小说生成工具",
+  "type": "module",
+  "main": "cli.js",
+  "bin": {
+    "xiaoshuo": "./cli.js"
+  },
+  "scripts": {
+    "start": "node cli.js",
+    "cli": "node cli.js",
+    "web": "node server/index.js",
+    "test": "node --test",
+    "test:e2e": "node scripts/browser-e2e.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "jsonrepair": "^3.15.0",
+    "uuid": "^11.0.5"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.61.1"
+  },
+  "license": "MIT",
+  "author": "fork from TvTink/xiaoshuo by 浪疯Koru"
+}

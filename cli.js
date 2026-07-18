@@ -1,0 +1,575 @@
+#!/usr/bin/env node
+/**
+ * xiaoshuo-cli — 命令行入口
+ *
+ * 基于 TvTink/xiaoshuo (https://cnb.cool/TvTink/xiaoshuo) 的后端模块，
+ * 在不启动 Express 的前提下提供 CLI 工具，所有 LLM 调度、上下文记忆、
+ * SQLite 持久化逻辑 100% 沿用原作者实现。
+ *
+ * 使用方法：
+ *   xiaoshuo list
+ *   xiaoshuo config
+ *   xiaoshuo new [-t 标题] [-g 类型] [-c 章数]
+ *   xiaoshuo outline <id>
+ *   xiaoshuo write <id> <章节号>
+ *   xiaoshuo continue <id> [起始章节]
+ *   xiaoshuo export <id> > 书名.txt
+ *   xiaoshuo derive <id> --mode sequel
+ *   xiaoshuo delete <id>
+ */
+
+import { v4 as uuid } from 'uuid';
+import * as db from './server/db.js';
+import { chat, chatStream } from './server/llm.js';
+import {
+  afterChapterWritten,
+  buildWritingContext,
+  generateOutline,
+  getOutlineBatchCount,
+  rebuildGlobalSummaryBefore,
+  regenerateContinuationOutline,
+  writeChapter,
+} from './server/context.js';
+
+const C = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+};
+
+const ok = (msg) => console.log(`${C.green}✓${C.reset} ${msg}`);
+const info = (msg) => console.log(`${C.blue}ℹ${C.reset} ${msg}`);
+const warn = (msg) => console.log(`${C.yellow}!${C.reset} ${msg}`);
+const err = (msg) => console.error(`${C.red}✗${C.reset} ${msg}`);
+const head = (msg) => console.log(`\n${C.bold}${C.cyan}${msg}${C.reset}\n${'─'.repeat(msg.length)}`);
+
+// ──────────────────────────── 参数解析 ────────────────────────────
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  // 找第一个非 flag token 作为命令
+  let cmdEnd = args.findIndex((a, i) => !a.startsWith('-'));
+  if (cmdEnd === -1) cmdEnd = args.length;
+  const cmd = args.slice(0, cmdEnd).find((a) => !a.startsWith('-')) || args[0];
+  const rest = args.slice(cmdEnd + 1);
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a.startsWith('--')) {
+      const key = a.slice(2);
+      const next = rest[i + 1];
+      if (next && !next.startsWith('--')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+    } else if (a.startsWith('-') && a.length === 2) {
+      const key = a.slice(1);
+      const next = rest[i + 1];
+      if (next && !next.startsWith('-')) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { cmd, positional, flags };
+}
+
+function usage() {
+  console.log(`${C.bold}xiaoshuo-cli${C.reset} — 长篇小说生成器 CLI
+
+${C.bold}用法:${C.reset}
+  xiaoshuo list                                列出所有作品
+  xiaoshuo config                              配置 LLM（交互式）
+  xiaoshuo new [-t 标题] [-g 类型] [-c 章数]   新建作品
+  xiaoshuo show <id>                           显示作品详情
+  xiaoshuo outline <id>                        生成大纲
+  xiaoshuo write <id> <章号>                   写指定章节
+  xiaoshuo continue <id> [起始章]              从某章连续写到结尾
+  xiaoshuo regenerate <id> <起始章> <新章数>    重规划后续大纲
+  xiaoshuo derive <id> --mode sequel|template  衍生续作/复用模板
+  xiaoshuo export <id>                         导出为 TXT（stdout）
+  xiaoshuo delete <id>                         删除作品
+
+${C.bold}配置项（环境变量或 settings 表）:${C.reset}
+  XIAOSHUO_BASE_URL  /  base_url    OpenAI 兼容接口地址
+  XIAOSHUO_API_KEY   /  api_key     API Key
+  XIAOSHUO_MODEL     /  model       模型名
+`);
+}
+
+// ──────────────────────────── 配置管理 ────────────────────────────
+
+function loadSettings() {
+  return db.getAllSettings();
+}
+
+async function cmdConfig() {
+  head('配置 LLM 连接');
+  const current = loadSettings();
+  const prompt = (label, key, placeholder = '') => {
+    const def = current[key] || '';
+    const hint = def ? `${C.dim}(当前: ${def.slice(0, 8)}***)${C.reset}` : `${C.dim}(留空: ${placeholder})${C.reset}`;
+    process.stdout.write(`${label} ${hint}: `);
+    return new Promise((resolve) => {
+      let buf = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.once('data', (d) => {
+        buf = d.toString().trim();
+        resolve(buf);
+      });
+    });
+  };
+
+  // 简单 stdin 处理：用 readline 模式
+  if (!process.stdin.isTTY) {
+    err('config 需要交互式终端（TTY）');
+    info('请手动设置环境变量或在 TTY 下运行 xiaoshuo config');
+    return;
+  }
+  const readline = await import('node:readline/promises');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  const baseUrl = (await rl.question(`接口地址 (当前: ${current.base_url || '未设置'}): `)).trim() || current.base_url;
+  const apiKeyRaw = (await rl.question(`API Key (当前: ${current.api_key ? '已设置' : '未设置'}): `)).trim();
+  const apiKey = apiKeyRaw || current.api_key || '';
+  const model = (await rl.question(`模型名 (当前: ${current.model || 'gpt-4o-mini'}): `)).trim() || current.model || 'gpt-4o-mini';
+  const temperature = (await rl.question(`温度 (当前: ${current.temperature || '0.85'}): `)).trim() || current.temperature || '0.85';
+  const maxTokens = (await rl.question(`max_tokens (当前: ${current.max_tokens || '4096'}): `)).trim() || current.max_tokens || '4096';
+
+  rl.close();
+
+  const next = { base_url: baseUrl, api_key: apiKey, model, temperature, max_tokens: maxTokens };
+  for (const [k, v] of Object.entries(next)) db.setSetting(k, String(v));
+
+  ok('配置已保存到 SQLite');
+
+  // 测试连接
+  const test = await chat(
+    [{ role: 'user', content: 'ping' }],
+    next,
+    { maxTokens: 16, timeout: 30000 }
+  ).then((r) => r).catch((e) => null);
+
+  if (test) ok(`测试连接成功，模型返回: ${C.dim}${JSON.stringify(test).slice(0, 80)}${C.reset}`);
+  else warn('测试连接失败，请检查配置');
+}
+
+// ──────────────────────────── 列表 / 显示 ────────────────────────────
+
+function cmdList() {
+  const projects = db.listProjects();
+  if (projects.length === 0) {
+    info('还没有作品。运行 `xiaoshuo new` 创建一个。');
+    return;
+  }
+  head(`作品列表（${projects.length} 部）`);
+  const w = [4, 30, 12, 10, 14, 20];
+  console.log(
+    `${C.dim}#  ${'ID'.padEnd(w[0])} ${'标题'.padEnd(w[1])} ${'类型'.padEnd(w[2])} ${'章数'.padEnd(w[3])} ${'状态'.padEnd(w[4])} ${'更新时间'.padEnd(w[5])}${C.reset}`
+  );
+  projects.forEach((p, i) => {
+    const idShort = p.id.slice(0, 8);
+    console.log(`${String(i + 1).padEnd(2)} ${idShort.padEnd(w[0])} ${(p.title || '').slice(0, 28).padEnd(w[1])} ${(p.genre || '').padEnd(w[2] - 2)}  ${String(p.chapter_count).padEnd(w[3] - 2)}  ${(p.status || '').padEnd(w[4] - 2)}  ${(p.updated_at || '').padEnd(w[5])}`);
+    console.log(`${C.dim}   full id: ${p.id}${C.reset}`);
+  });
+}
+
+function findProject(id) {
+  const all = db.listProjects();
+  return all.find((p) => p.id === id || p.id.startsWith(id)) || db.getProject(id);
+}
+
+function cmdShow(id) {
+  const project = findProject(id);
+  if (!project) return err(`未找到作品: ${id}`);
+  head(`作品详情: 《${project.title}》`);
+  const fields = [
+    ['ID', project.id],
+    ['类型', project.genre],
+    ['主题', project.theme],
+    ['章数', project.chapter_count],
+    ['每章字数', project.words_per_chapter],
+    ['文风', project.style],
+    ['状态', project.status],
+    ['参考作品', project.reference_project_id || '(无)'],
+    ['参考模式', project.reference_mode || '(无)'],
+    ['全局摘要长度', (project.global_summary || '').length + ' 字'],
+    ['创建时间', project.created_at],
+    ['更新时间', project.updated_at],
+  ];
+  fields.forEach(([k, v]) => console.log(`  ${C.dim}${k}:${C.reset} ${v}`));
+
+  const chapters = db.listChapters(project.id);
+  console.log(`\n${C.bold}章节进度（${chapters.length} 章）${C.reset}`);
+  if (chapters.length === 0) info('  还没有章节');
+  else {
+    chapters.forEach((c) => {
+      const icon = c.status === 'done' ? `${C.green}✓${C.reset}` : c.status === 'writing' ? `${C.yellow}…${C.reset}` : `${C.dim}○${C.reset}`;
+      const len = (c.content || '').length;
+      console.log(`  ${icon} 第${c.chapter_num}章 ${c.title || '(无标题)'}  ${C.dim}${len}字${C.reset}`);
+    });
+  }
+}
+
+// ──────────────────────────── 新建 ────────────────────────────
+
+async function cmdNew(flags) {
+  head('新建作品');
+  const hasAll = flags.t && flags.g && flags.c;
+  const isInteractive = process.stdin.isTTY && !hasAll;
+  let title, genre, theme, chapterCount, wordsPerChapter, style, extra;
+
+  if (!isInteractive) {
+    // 命令行参数或非 TTY 模式
+    title = flags.t || flags.title || '未命名小说';
+    genre = flags.g || flags.genre || '玄幻';
+    theme = flags.theme || `${genre}题材`;
+    chapterCount = Number(flags.c || flags.chapters || 30);
+    wordsPerChapter = Number(flags.w || flags.words || 2000);
+    style = flags.s || flags.style || '通俗流畅';
+    extra = flags.extra || '';
+  } else {
+    const readline = await import('node:readline/promises');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    const ask = async (label, def = '') => {
+      const v = (await rl.question(`${label}${def ? ` ${C.dim}(默认: ${def})${C.reset}: ` : ': '}`)).trim();
+      return v || def;
+    };
+
+    title = flags.t || flags.title || (await ask('书名', '未命名小说'));
+    genre = flags.g || flags.genre || (await ask('类型 (玄幻/都市/科幻...)', '玄幻'));
+    theme = flags.theme || (await ask('主题/核心卖点', `${genre}题材`));
+    chapterCount = Number(flags.c || flags.chapters || (await ask('总章数', '30')));
+    wordsPerChapter = Number(flags.w || flags.words || (await ask('每章字数', '2000')));
+    style = flags.s || flags.style || (await ask('文风 (冷峻/轻松/诗意...)', '通俗流畅'));
+    extra = await ask('附加设定 (可空)', '');
+    rl.close();
+  }
+
+  const project = db.createProject({
+    id: uuid(),
+    title,
+    genre,
+    theme,
+    chapter_count: chapterCount,
+    words_per_chapter: wordsPerChapter,
+    style,
+    extra_prompt: extra,
+    status: 'draft',
+  });
+  ok(`已创建作品《${title}》`);
+  info(`ID: ${project.id}`);
+  info(`下一步: xiaoshuo outline ${project.id.slice(0, 8)}`);
+}
+
+// ──────────────────────────── 大纲生成 ────────────────────────────
+
+async function runOutlineJob(jobId, settingsObj) {
+  const job = db.getGenerationJob(jobId);
+  const project = db.getProject(job.project_id);
+  const totalBatches = job.total_batches;
+
+  info(`开始生成大纲，共 ${totalBatches} 批次`);
+
+  for (let batch = job.current_batch; batch <= totalBatches; batch++) {
+    process.stdout.write(`${C.dim}  [批次 ${batch}/${totalBatches}]${C.reset} 生成中...`);
+    try {
+      await generateOutline(project, settingsObj, {
+        batch,
+        totalBatches,
+        existingOutline: job.checkpoint_json && job.checkpoint_json !== '{}' ? JSON.parse(job.checkpoint_json) : null,
+      });
+
+      // 把当前进度写回 checkpoint
+      db.updateGenerationJob(jobId, {
+        completed_batches: batch,
+        current_batch: batch + 1,
+        checkpoint_json: JSON.stringify({ batch }),
+      });
+      process.stdout.write(`\r${C.green}  [批次 ${batch}/${totalBatches}] 完成${C.reset}                    \n`);
+    } catch (e) {
+      db.updateGenerationJob(jobId, { status: 'failed', error: String(e.message || e) });
+      err(`批次 ${batch} 失败: ${e.message}`);
+      warn(`可运行 xiaoshuo outline ${project.id.slice(0, 8)} 重试`);
+      return;
+    }
+  }
+
+  db.updateGenerationJob(jobId, { status: 'done', error: '' });
+  db.updateProject(project.id, { status: 'planning' });
+  ok('大纲生成完毕');
+}
+
+async function cmdOutline(id) {
+  const project = findProject(id);
+  if (!project) return err(`未找到作品: ${id}`);
+  if (project.status === 'writing' || project.status === 'completed') {
+    return warn('已开始写作，不能重新生成全书大纲');
+  }
+  const settingsObj = loadSettings();
+  const totalBatches = getOutlineBatchCount(project.chapter_count);
+  const job = db.createGenerationJob({
+    id: uuid(),
+    project_id: project.id,
+    job_type: 'outline',
+    status: 'running',
+    total_batches: totalBatches,
+    completed_batches: 0,
+    current_batch: 1,
+    error: '',
+    checkpoint_json: '{}',
+  });
+  db.updateProject(project.id, { status: 'planning' });
+  await runOutlineJob(job.id, settingsObj);
+
+  // 跑完打印大纲摘要
+  const updated = db.getProject(project.id);
+  if (updated.outline_json) {
+    const outline = JSON.parse(updated.outline_json);
+    head('大纲已生成');
+    if (outline.title_suggestion) info(`建议书名: ${outline.title_suggestion}`);
+    if (outline.plot?.premise) info(`核心卖点: ${outline.plot.premise}`);
+    if (outline.chapters) info(`章节数: ${outline.chapters.length}`);
+    info(`下一步: xiaoshuo outline-confirm ${project.id.slice(0, 8)}`);
+  }
+}
+
+// ──────────────────────────── 写作 ────────────────────────────
+
+async function cmdWrite(id, num) {
+  const project = findProject(id);
+  if (!project) return err(`未找到作品: ${id}`);
+  const chapter = db.getChapter(project.id, Number(num));
+  if (!chapter) return err(`第 ${num} 章不存在，请先生成大纲`);
+
+  if (!['ready', 'writing'].includes(project.status)) {
+    return warn(`作品状态为 ${project.status}，请先运行 xiaoshuo outline-confirm 确认大纲`);
+  }
+
+  const settingsObj = loadSettings();
+
+  // 检查前序章节
+  const prev = db.listChapters(project.id).find((c) => c.chapter_num < Number(num) && c.status !== 'done');
+  if (prev) return warn(`请先完成第 ${prev.chapter_num} 章`);
+
+  head(`写作: 《${project.title}》 第 ${num} 章`);
+  db.updateProject(project.id, { status: 'writing' });
+  db.updateChapter(project.id, Number(num), { status: 'writing', content: '' });
+
+  const stream = await writeChapter(project, Number(num), settingsObj, { stream: true });
+  let content = '';
+  let lastPrint = 0;
+  process.stdout.write(`${C.dim}（流式生成中...）${C.reset}\n\n`);
+  for await (const delta of stream) {
+    content += delta;
+    if (content.length - lastPrint > 800) {
+      process.stdout.write(delta);
+      lastPrint = content.length;
+    }
+  }
+  process.stdout.write(delta ? delta.slice(lastPrint - content.length + delta.length) : '');
+  process.stdout.write('\n\n');
+
+  db.updateChapter(project.id, Number(num), { content, status: 'summarizing' });
+  ok(`正文已落盘（${content.length} 字）`);
+  info('生成摘要与记忆...');
+
+  try {
+    const memory = await afterChapterWritten(project.id, Number(num), settingsObj);
+    ok(`摘要完成（${memory.summary.length} 字，${memory.memoryCount} 条记忆）`);
+    const done = db.listChapters(project.id).filter((c) => c.status === 'done').length;
+    if (done === project.chapter_count) {
+      db.updateProject(project.id, { status: 'completed' });
+      ok('🎉 全部章节完成！运行 `xiaoshuo export <id>` 导出');
+    } else {
+      info(`进度: ${done}/${project.chapter_count} 章`);
+    }
+  } catch (e) {
+    err(`摘要生成失败: ${e.message}`);
+    warn(`章节已标记为 generated，运行 xiaoshuo finalize ${id} ${num} 重试摘要`);
+  }
+}
+
+async function cmdContinue(id, startNum) {
+  const project = findProject(id);
+  if (!project) return err(`未找到作品: ${id}`);
+  const settingsObj = loadSettings();
+
+  const chapters = db.listChapters(project.id);
+  const start = startNum
+    ? Number(startNum)
+    : (chapters.find((c) => c.status !== 'done')?.chapter_num ?? chapters.length + 1);
+
+  for (let n = start; n <= project.chapter_count; n++) {
+    await cmdWrite(id, n);
+  }
+}
+
+async function cmdFinalize(id, num) {
+  const settingsObj = loadSettings();
+  info(`重新整理第 ${num} 章摘要...`);
+  const memory = await afterChapterWritten(id, Number(num), settingsObj);
+  ok(`完成（${memory.memoryCount} 条记忆）`);
+}
+
+async function cmdRegenerate(id, startChapter, newCount, instruction) {
+  const project = findProject(id);
+  if (!project) return err(`未找到作品: ${id}`);
+  const settingsObj = loadSettings();
+  info(`重规划第 ${startChapter} 章起的后续大纲...`);
+  await regenerateContinuationOutline(project, Number(startChapter), Number(newCount), instruction, settingsObj);
+  ok('重规划完成');
+}
+
+// ──────────────────────────── 衍生 ────────────────────────────
+
+async function cmdDerive(sourceId, mode) {
+  const source = findProject(sourceId);
+  if (!source) return err(`未找到源作品: ${sourceId}`);
+  const settingsObj = loadSettings();
+
+  let title, instruction;
+  if (!process.stdin.isTTY) {
+    title = flags.title || `${source.title}（续）`;
+    instruction = flags.instruction || '';
+  } else {
+    const readline = await import('node:readline/promises');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+    title = (await rl.question(`新书名 (回车=续作同名): `)).trim() || `${source.title}（续）`;
+    instruction = mode === 'template'
+      ? ''
+      : await rl.question('续作方向/要求（可空）: ');
+    rl.close();
+  }
+
+  const newId = uuid();
+  const chapters = db.listChapters(source.id);
+  const newCount = source.chapter_count;
+
+  db.createProject({
+    id: newId,
+    title,
+    genre: mode === 'template' ? source.genre : source.genre,
+    theme: mode === 'template' ? source.theme : `${source.theme}（续）`,
+    chapter_count: newCount,
+    words_per_chapter: source.words_per_chapter,
+    style: source.style,
+    extra_prompt: instruction,
+    status: 'draft',
+    reference_project_id: mode === 'sequel' ? source.id : '',
+    reference_mode: mode === 'sequel' ? 'comprehensive' : '',
+  });
+
+  ok(`衍生作品已创建: 《${title}》`);
+  info(`ID: ${newId}`);
+}
+
+// ──────────────────────────── 导出 / 删除 ────────────────────────────
+
+function cmdExport(id) {
+  const project = findProject(id);
+  if (!project) return err(`未找到作品: ${id}`);
+  const chapters = db.listChapters(project.id).filter((c) => c.content);
+  const body = chapters
+    .map((c) => `第${c.chapter_num}章 ${c.title}\n\n${c.content}`)
+    .join('\n\n\n');
+  process.stdout.write(`《${project.title}》\n\n${body}`);
+  info(`\n[已输出 ${chapters.length} 章，共 ${body.length} 字]`, );
+}
+
+function cmdDelete(id) {
+  const project = findProject(id);
+  if (!project) return err(`未找到作品: ${id}`);
+  db.deleteProject(project.id);
+  ok(`已删除《${project.title}》`);
+}
+
+// ──────────────────────────── 主入口 ────────────────────────────
+
+async function main() {
+  const { cmd, positional, flags } = parseArgs(process.argv);
+
+  try {
+    switch (cmd) {
+      case 'list':
+      case 'ls':
+        cmdList(); break;
+      case 'config':
+      case 'cfg':
+        await cmdConfig(); break;
+      case 'new':
+      case 'create':
+        await cmdNew(flags); break;
+      case 'show':
+      case 'view':
+        if (!positional[0]) return usage();
+        cmdShow(positional[0]); break;
+      case 'outline':
+        if (!positional[0]) return usage();
+        await cmdOutline(positional[0]); break;
+      case 'outline-confirm':
+        if (!positional[0]) return usage();
+        {
+          const project = findProject(positional[0]);
+          if (project) {
+            db.updateProject(project.id, { status: 'ready' });
+            ok(`《${project.title}》已进入可写作状态`);
+          }
+        }
+        break;
+      case 'write':
+        if (!positional[0] || !positional[1]) return usage();
+        await cmdWrite(positional[0], positional[1]); break;
+      case 'continue':
+      case 'cont':
+        if (!positional[0]) return usage();
+        await cmdContinue(positional[0], positional[1]); break;
+      case 'finalize':
+        if (!positional[0] || !positional[1]) return usage();
+        await cmdFinalize(positional[0], positional[1]); break;
+      case 'regenerate':
+        if (!positional[0] || !positional[1] || !positional[2]) return usage();
+        await cmdRegenerate(positional[0], positional[1], positional[2], flags.instruction || ''); break;
+      case 'derive':
+        if (!positional[0]) return usage();
+        await cmdDerive(positional[0], flags.mode || 'sequel'); break;
+      case 'export':
+        if (!positional[0]) return usage();
+        cmdExport(positional[0]); break;
+      case 'delete':
+      case 'rm':
+        if (!positional[0]) return usage();
+        cmdDelete(positional[0]); break;
+      case 'help':
+      case '--help':
+      case '-h':
+      case undefined:
+        usage(); break;
+      default:
+        err(`未知命令: ${cmd}`);
+        usage();
+        process.exit(1);
+    }
+  } catch (e) {
+    err(`错误: ${e.message}`);
+    if (process.env.DEBUG) console.error(e.stack);
+    process.exit(1);
+  }
+}
+
+main();
