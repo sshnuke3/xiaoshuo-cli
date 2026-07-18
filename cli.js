@@ -550,8 +550,9 @@ function cmdExport(id) {
   const body = chapters
     .map((c) => `第${c.chapter_num}章 ${c.title}\n\n${c.content}`)
     .join('\n\n\n');
+  // 只把内容写到 stdout，进度提示走 stderr（避免污染管道）
   process.stdout.write(`《${project.title}》\n\n${body}`);
-  info(`\n[已输出 ${chapters.length} 章，共 ${body.length} 字]`, );
+  process.stderr.write(`${C.blue}ℹ${C.reset} 已输出 ${chapters.length} 章，共 ${body.length} 字到 stdout\n`);
 }
 
 function cmdDelete(id) {
