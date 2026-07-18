@@ -285,33 +285,90 @@ async function runOutlineJob(jobId, settingsObj) {
 
   info(`开始生成大纲，共 ${totalBatches} 批次`);
 
-  for (let batch = job.current_batch; batch <= totalBatches; batch++) {
-    process.stdout.write(`${C.dim}  [批次 ${batch}/${totalBatches}]${C.reset} 生成中...`);
-    try {
-      await generateOutline(project, settingsObj, {
-        batch,
-        totalBatches,
-        existingOutline: job.checkpoint_json && job.checkpoint_json !== '{}' ? JSON.parse(job.checkpoint_json) : null,
-      });
+  let checkpoint = {};
+  try { checkpoint = JSON.parse(job.checkpoint_json || '{}'); } catch {}
 
-      // 把当前进度写回 checkpoint
-      db.updateGenerationJob(jobId, {
-        completed_batches: batch,
-        current_batch: batch + 1,
-        checkpoint_json: JSON.stringify({ batch }),
-      });
-      process.stdout.write(`\r${C.green}  [批次 ${batch}/${totalBatches}] 完成${C.reset}                    \n`);
-    } catch (e) {
-      db.updateGenerationJob(jobId, { status: 'failed', error: String(e.message || e) });
-      err(`批次 ${batch} 失败: ${e.message}`);
-      warn(`可运行 xiaoshuo outline ${project.id.slice(0, 8)} 重试`);
-      return;
+  try {
+    const outline = await generateOutline(project, settingsObj, {
+      checkpoint,
+      onPlan: (plan) => {
+        checkpoint = { plan, chapters: [] };
+        db.updateGenerationJob(jobId, {
+          completed_batches: 1,
+          current_batch: 2,
+          checkpoint_json: JSON.stringify(checkpoint),
+        });
+        process.stdout.write(`${C.dim}  [规划完成]${C.reset}`);
+      },
+      onBatch: ({ plan, chapters, completedBatches, totalBatches: tb }) => {
+        checkpoint = { plan, chapters };
+        db.updateGenerationJob(jobId, {
+          total_batches: tb,
+          completed_batches: completedBatches,
+          current_batch: Math.min(tb, completedBatches + 1),
+          checkpoint_json: JSON.stringify(checkpoint),
+        });
+        process.stdout.write(`\r${C.green}  [批次 ${completedBatches}/${tb}] 完成${C.reset}                    `);
+      },
+    });
+
+    // 落库完整 outline（内联实现，避免 import index.js 启动 express）
+    const normalized = {
+      title_suggestion: outline.title_suggestion || project.title,
+      world: outline.world || {},
+      characters: Array.isArray(outline.characters) ? outline.characters : [],
+      timeline: Array.isArray(outline.timeline) ? outline.timeline : [],
+      plot: outline.plot || {},
+      chapters: Array.isArray(outline.chapters) ? outline.chapters : [],
+    };
+    if (normalized.chapters.length !== project.chapter_count) {
+      db.updateGenerationJob(jobId, { status: 'failed', error: `章节数 ${normalized.chapters.length} ≠ ${project.chapter_count}` });
+      return err(`章节数不匹配: ${normalized.chapters.length} ≠ ${project.chapter_count}`);
     }
-  }
+    normalized.chapters = normalized.chapters.map((chapter, index) => ({
+      ...chapter,
+      num: index + 1,
+      title: String(chapter.title || `第${index + 1}章`).trim(),
+      summary: String(chapter.summary || '').trim(),
+    }));
+    db.updateProject(project.id, {
+      outline_json: JSON.stringify(normalized),
+      characters_json: JSON.stringify(normalized.characters),
+      timeline_json: JSON.stringify(normalized.timeline),
+      plot_json: JSON.stringify(normalized.plot),
+      world_json: JSON.stringify(normalized.world),
+      status: 'planning',
+    });
+    // 写每章的 chapters 行（这是原 saveOutline 最重要的一步）
+    for (const chapter of normalized.chapters) {
+      const existing = db.getChapter(project.id, chapter.num);
+      db.upsertChapter({
+        id: existing?.id || uuid(),
+        project_id: project.id,
+        chapter_num: chapter.num,
+        title: chapter.title,
+        outline: chapter.summary,
+        content: existing?.content || '',
+        summary: existing?.summary || '',
+        status: existing?.status || 'pending',
+      });
+    }
 
-  db.updateGenerationJob(jobId, { status: 'done', error: '' });
-  db.updateProject(project.id, { status: 'planning' });
-  ok('大纲生成完毕');
+    db.updateGenerationJob(jobId, {
+      status: 'done',
+      completed_batches: totalBatches,
+      current_batch: totalBatches,
+      error: '',
+      checkpoint_json: JSON.stringify({ plan: checkpoint.plan, chapters: outline.chapters }),
+    });
+    process.stdout.write('\n');
+    ok('大纲生成完毕');
+  } catch (e) {
+    db.updateGenerationJob(jobId, { status: 'failed', error: String(e.message || e) });
+    db.updateProject(project.id, { status: 'planning_failed' });
+    err(`生成失败: ${e.message}`);
+    warn(`可运行 xiaoshuo outline ${project.id.slice(0, 8)} 重试`);
+  }
 }
 
 async function cmdOutline(id) {
@@ -373,15 +430,20 @@ async function cmdWrite(id, num) {
   const stream = await writeChapter(project, Number(num), settingsObj, { stream: true });
   let content = '';
   let lastPrint = 0;
+  let lastDelta = '';
   process.stdout.write(`${C.dim}（流式生成中...）${C.reset}\n\n`);
   for await (const delta of stream) {
     content += delta;
+    lastDelta = delta;
     if (content.length - lastPrint > 800) {
       process.stdout.write(delta);
       lastPrint = content.length;
     }
   }
-  process.stdout.write(delta ? delta.slice(lastPrint - content.length + delta.length) : '');
+  // 打印剩余未刷新的尾巴
+  if (content.length > lastPrint) {
+    process.stdout.write(content.slice(lastPrint));
+  }
   process.stdout.write('\n\n');
 
   db.updateChapter(project.id, Number(num), { content, status: 'summarizing' });
