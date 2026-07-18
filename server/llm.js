@@ -108,6 +108,16 @@ export async function* chatStream(messages, settings, options = {}) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  // thinking 模型（如 qwen3.6-35b-a3b）会把推理与正文一起吐在 reasoning 里
+  // 记录到输出标记才能 forward，避免把「思考过程」当章节正文输出
+  const outputMarkers = [
+    /\[输出[:：]\s*\]/,
+    /\[Output Generation\]/i,
+    /【答案】/,
+  ];
+  let outputStarted = false;
+  // 收留并检查足够多的文本再决定是否开始转发
+  let pendingText = '';
 
   while (true) {
     const { done, value } = await reader.read();
@@ -122,8 +132,30 @@ export async function* chatStream(messages, settings, options = {}) {
       if (data === '[DONE]') return;
       try {
         const json = JSON.parse(data);
-        const delta = json.choices?.[0]?.delta?.content;
-        if (delta) yield delta;
+        const d = json.choices?.[0]?.delta;
+        // thinking 模式 fallback：有些模型（如 qwen3.6-35b-a3b）把增量放在 reasoning 字段
+        const delta = d?.content ?? d?.reasoning;
+        if (!delta) continue;
+
+        if (!outputStarted) {
+          pendingText += delta;
+          const hit = outputMarkers.find((re) => re.test(pendingText));
+          if (hit) {
+            outputStarted = true;
+            // 输出标记之后的才是「干净正文」
+            const idx = pendingText.search(hit);
+            const after = pendingText.slice(idx).replace(hit, '');
+            if (after.trim()) yield after;
+            pendingText = '';
+          } else if (pendingText.length > 80000) {
+            // 一直找不到标记，输出采样停了（防止内存爆）
+            outputStarted = true;
+            if (pendingText.trim()) yield pendingText.slice(-2000);
+            pendingText = '';
+          }
+        } else {
+          yield delta;
+        }
       } catch {
         // ignore partial json
       }
