@@ -116,6 +116,34 @@ function loadSettings() {
   return db.getAllSettings();
 }
 
+// 标题补全：检测「第 N 章」偷懒模式，用 LLM 重新生成标题
+async function fixLazyTitles(projectId, settingsObj) {
+  const chapters = db.listChapters(projectId);
+  const lazy = chapters.filter((c) => /^第[\s一-十百零\d]+章(（完）)?$/.test(c.title || ''));
+  if (lazy.length === 0) return 0;
+  info(`检测到 ${lazy.length} 章标题偷懒，补全中...`);
+  let fixed = 0;
+  for (const ch of lazy) {
+    if (!ch.summary || ch.summary === '待细化') continue;
+    const prompt = `根据章节剧情要点，生成一个 4-12 字的独特章节标题。
+要求：吸引人、不与现有章节标题重复、贴合剧情。
+剧情：${ch.summary}
+只输出新标题，不要引号、不要解释。`;
+    try {
+      const newTitle = (await chat(
+        [{ role: 'user', content: prompt }],
+        settingsObj,
+        { temperature: 0.9, maxTokens: 30, timeout: 30000 }
+      )).trim().split(/[\n\r]/)[0].replace(/^["「]|["」]$/g, '').slice(0, 16);
+      if (newTitle && newTitle !== ch.title) {
+        db.updateChapter(projectId, ch.chapter_num, { title: newTitle });
+        fixed++;
+      }
+    } catch { /* 忽略单项失败 */ }
+  }
+  return fixed;
+}
+
 async function cmdConfig() {
   head('配置 LLM 连接');
   const current = loadSettings();
@@ -401,6 +429,11 @@ async function cmdOutline(id) {
     if (outline.title_suggestion) info(`建议书名: ${outline.title_suggestion}`);
     if (outline.plot?.premise) info(`核心卖点: ${outline.plot.premise}`);
     if (outline.chapters) info(`章节数: ${outline.chapters.length}`);
+
+    // 检测并补全标题偷懒
+    const fixed = await fixLazyTitles(project.id, settingsObj);
+    if (fixed > 0) ok(`已补全 ${fixed} 章偷懒标题`);
+
     info(`下一步: xiaoshuo outline-confirm ${project.id.slice(0, 8)}`);
   }
 }

@@ -15,8 +15,8 @@ import * as db from './db.js';
 
 const RECENT_FULL_CHAPTERS = 1;
 const RECENT_SUMMARY_CHAPTERS = 5;
-const OUTLINE_BATCH_SIZE = 20;
-const BATCHED_OUTLINE_THRESHOLD = 50;
+const OUTLINE_BATCH_SIZE = 10;
+const BATCHED_OUTLINE_THRESHOLD = 10;
 
 export function getOutlineBatchCount(chapterCount) {
   return chapterCount > BATCHED_OUTLINE_THRESHOLD
