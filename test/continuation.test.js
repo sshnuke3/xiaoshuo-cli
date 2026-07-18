@@ -161,8 +161,8 @@ test('generates long outlines in sequential batches', async () => {
     onBatch: ({ completedBatches }) => progress.push(completedBatches),
   });
 
-  assert.equal(calls, 6);
-  assert.deepEqual(progress, [1, 2, 3, 4, 5, 6]);
+  assert.equal(calls, 10);
+  assert.deepEqual(progress, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   assert.equal(outline.chapters.length, 81);
   assert.equal(outline.chapters[0].num, 1);
   assert.equal(outline.chapters[80].num, 81);
@@ -192,7 +192,7 @@ test('generates long outlines in sequential batches', async () => {
       chapters: outline.chapters.slice(0, 40),
     },
   });
-  assert.equal(calls, 3);
+  assert.equal(calls, 5);
   assert.equal(resumed.chapters.length, 81);
   assert.equal(resumed.chapters[40].num, 41);
 });

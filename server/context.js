@@ -733,11 +733,11 @@ export async function writeChapter(project, chapterNum, settings, { stream = fal
 
   if (stream) {
     const { chatStream } = await import('./llm.js');
-    return chatStream(messages, settings, { temperature: 0.85, maxTokens: Math.max(4096, Math.ceil(words * 2.2)) });
+    return chatStream(messages, settings, { temperature: 0.85, maxTokens: Math.max(8192, Math.ceil(words * 3.5)) });
   }
 
   return chat(messages, settings, {
     temperature: 0.85,
-    maxTokens: Math.max(4096, Math.ceil(words * 2.2)),
+    maxTokens: Math.max(8192, Math.ceil(words * 3.5)),
   });
 }

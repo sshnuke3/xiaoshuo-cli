@@ -157,6 +157,45 @@ function cleanChapterContent(text) {
   return result;
 }
 
+// 续写章节：thinking 模型撞 max_tokens 后字数不足时调用
+// 传入已写好的正文，请求接着写后续内容，直到达到目标字数
+async function continueChapter(project, chapterNum, currentContent, targetWords, settingsObj) {
+  let result = currentContent;
+  let attempts = 0;
+  const maxAttempts = 3;
+  while (result.length < targetWords * 0.9 && attempts < maxAttempts) {
+    attempts++;
+    const remaining = targetWords - result.length;
+    info(`续写第 ${attempts}/${maxAttempts} 次，还需 ≈${remaining} 字`);
+    const tail = result.slice(-200); // 最近 200 字作为衔接
+    const system = `你是专业网文作者。继续撰写小说正文，不要复述、重写、总结已完成部分，直接续写。`;
+    const user = `上一段结尾：
+${tail}
+
+请直接续写下一段（约 ${Math.min(6000, Math.ceil(remaining * 3.5))} tokens、${remaining} 字中文以上），保持相同语气和人物。`;
+
+    let extra;
+    try {
+      extra = await chat(
+        [{ role: 'system', content: system }, { role: 'user', content: user }],
+        settingsObj,
+        { temperature: 0.85, maxTokens: Math.max(8192, Math.ceil(remaining * 3.5)), timeout: 600000 }
+      );
+    } catch (e) {
+      warn(`续写失败: ${e.message.slice(0, 100)}`);
+      break;
+    }
+    const cleaned = cleanChapterContent(extra);
+    if (cleaned.length < 100) {
+      warn('续写产物不足 100 字，中止');
+      break;
+    }
+    result += '\n\n' + cleaned;
+    info(`续写后总字数: ${result.length}`);
+  }
+  return result;
+}
+
 // 标题补全：检测「第 N 章」偷懒模式，用 LLM 重新生成标题
 async function fixLazyTitles(projectId, settingsObj) {
   const chapters = db.listChapters(projectId);
@@ -533,9 +572,18 @@ process.stdout.write('\n\n');
 
   // 后处理：thinking 模型（如 qwen3.6）会在正文后输出 self-correction 元数据
   // 截取最后一次连续的「干净中文段落」（>100 字）
-  const cleaned = cleanChapterContent(content);
+  let cleaned = cleanChapterContent(content);
   if (cleaned.length !== content.length) {
     warn(`原句 ${content.length} 字 → 净化后 ${cleaned.length} 字（去 ${content.length - cleaned.length} 字元数据）`);
+  }
+
+  // 续写保底：thinking 模型撞 max_tokens 后正文可能严重不足
+  // 如果净化后不足目标字数的 70%，自动续写
+  const target = project.words_per_chapter || 2000;
+  if (cleaned.length < target * 0.7) {
+    warn(`正文 ${cleaned.length} 字不足目标 ${target} 字×70%=${Math.floor(target * 0.7)}，触发续写`);
+    cleaned = await continueChapter(project, num, cleaned, target, settingsObj);
+    ok(`续写后 ${cleaned.length} 字`);
   }
 
   db.updateChapter(project.id, Number(num), { content: cleaned, status: 'summarizing' });

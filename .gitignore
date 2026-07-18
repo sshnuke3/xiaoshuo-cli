@@ -7,3 +7,7 @@ data/
 .DS_Store
 *.log
 npm-debug.log*
+# Export 产物（xiaoshuo export 命令输出，按 README 不入库）
+# 注意：会匹配根目录所有 .txt（包括 README 之类）→ 用 / 限定根
+/*.txt
+_*.mjs
