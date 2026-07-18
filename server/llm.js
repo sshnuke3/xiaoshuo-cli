@@ -89,6 +89,9 @@ export async function chat(messages, settings, options = {}) {
           }
           const content = data?.choices?.[0]?.message?.content;
           if (content) return content;
+          // thinking 模式 fallback：有些模型（如 qwen3.6-35b-a3b）把正文放在 reasoning 字段
+          const reasoning = data?.choices?.[0]?.message?.reasoning;
+          if (reasoning) return reasoning;
           if (data) lastError = new Error(`模型返回为空或格式不兼容：${text.slice(0, 300)}`);
         }
       }
