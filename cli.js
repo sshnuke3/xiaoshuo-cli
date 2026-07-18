@@ -116,6 +116,47 @@ function loadSettings() {
   return db.getAllSettings();
 }
 
+// 章节后处理：thinking 模型在正文后还会追加 self-correction 元数据
+// 取最后一次连续的中文段落（超过 100 字且中文字符密度 > 70%）作为干净正文
+function cleanChapterContent(text) {
+  if (!text) return text;
+  // qwen3.6-35b-a3b 输出模式：
+  //   - thinking 文本 + 英文自评
+  //   - 草稿答案（被自评包裹）
+  //   - 真正章节正文（重复输出一遍）
+  // 策略：按行扫描，仅保留「中文字符密度 >= 80% 且长度 >= 100 字」的行
+  // 合并连续合格行作为最终正文。
+  // 这样会跳过 thinking/英文自评，只保留真正的小说正文。
+
+  const lines = text.split(/\r?\n/);
+  const goodLines = [];
+  let consecutive = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      consecutive = 0;
+      continue;
+    }
+    const chineseChars = (trimmed.match(/[\u4e00-\u9fa5]/g) || []).length;
+    const ratio = chineseChars / trimmed.length;
+    // 阈值：70% 以上中文，且行总长 >= 20 字
+    if (ratio >= 0.7 && trimmed.length >= 20) {
+      goodLines.push(trimmed);
+      consecutive++;
+    } else {
+      // 遇到不达标行：如果已有合格连续段就收尾
+      if (goodLines.length > 0 && consecutive > 0) {
+        // 间隔充许，但重置连续计数
+        consecutive = 0;
+      }
+    }
+  }
+
+  const result = goodLines.join('\n');
+  if (result.length < 100) return text.trim(); // 太短回暖原始
+  return result;
+}
+
 // 标题补全：检测「第 N 章」偷懒模式，用 LLM 重新生成标题
 async function fixLazyTitles(projectId, settingsObj) {
   const chapters = db.listChapters(projectId);
@@ -460,27 +501,45 @@ async function cmdWrite(id, num) {
   db.updateProject(project.id, { status: 'writing' });
   db.updateChapter(project.id, Number(num), { status: 'writing', content: '' });
 
-  const stream = await writeChapter(project, Number(num), settingsObj, { stream: true });
-  let content = '';
-  let lastPrint = 0;
-  let lastDelta = '';
-  process.stdout.write(`${C.dim}（流式生成中...）${C.reset}\n\n`);
+  // 检测 thinking 模型：qwen3.6 / 类似的会把推理与正文一起吐
+// 后续 cleanChapterContent 才能可靠拿到干净正文
+// 所以默认走非流式（避免流式中途网络抖动导致 0 字污染）
+const isThinkingModel = (() => {
+  try { return loadSettings().model?.includes('qwen3.6'); } catch { return false; }
+})();
+const stream = isThinkingModel
+  ? null  // thinking 走非流式
+  : await writeChapter(project, Number(num), settingsObj, { stream: true });
+let content = '';
+let lastPrint = 0;
+process.stdout.write(`${C.dim}（${isThinkingModel ? '非流式（thinking 模型）' : '流式'}生成中...）${C.reset}\n\n`);
+if (stream) {
   for await (const delta of stream) {
     content += delta;
-    lastDelta = delta;
     if (content.length - lastPrint > 800) {
       process.stdout.write(delta);
       lastPrint = content.length;
     }
   }
-  // 打印剩余未刷新的尾巴
   if (content.length > lastPrint) {
     process.stdout.write(content.slice(lastPrint));
   }
-  process.stdout.write('\n\n');
+} else {
+  content = await writeChapter(project, Number(num), settingsObj, { stream: false });
+  process.stdout.write(content.slice(0, 300));
+  if (content.length > 300) process.stdout.write(`\n[...省略 \${content.length - 300} 字...]\n`);
+}
+process.stdout.write('\n\n');
 
-  db.updateChapter(project.id, Number(num), { content, status: 'summarizing' });
-  ok(`正文已落盘（${content.length} 字）`);
+  // 后处理：thinking 模型（如 qwen3.6）会在正文后输出 self-correction 元数据
+  // 截取最后一次连续的「干净中文段落」（>100 字）
+  const cleaned = cleanChapterContent(content);
+  if (cleaned.length !== content.length) {
+    warn(`原句 ${content.length} 字 → 净化后 ${cleaned.length} 字（去 ${content.length - cleaned.length} 字元数据）`);
+  }
+
+  db.updateChapter(project.id, Number(num), { content: cleaned, status: 'summarizing' });
+  ok(`正文已落盘（${cleaned.length} 字）`);
   info('生成摘要与记忆...');
 
   try {
