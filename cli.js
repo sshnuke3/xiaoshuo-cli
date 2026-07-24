@@ -304,7 +304,9 @@ function cmdList() {
 
 function findProject(id) {
   const all = db.listProjects();
-  return all.find((p) => p.id === id || p.id.startsWith(id)) || db.getProject(id);
+  const found = all.find((p) => p.id === id || p.id.startsWith(id));
+  // 拿完整对象（含 outline_json / characters_json 等大字段），listProjects 不返回这些列。
+  return found ? db.getProject(found.id) : db.getProject(id);
 }
 
 function cmdShow(id) {
@@ -463,7 +465,7 @@ async function runOutlineJob(jobId, settingsObj) {
       timeline_json: JSON.stringify(normalized.timeline),
       plot_json: JSON.stringify(normalized.plot),
       world_json: JSON.stringify(normalized.world),
-      status: 'planning',
+      status: 'ready',
     });
     // 写每章的 chapters 行（这是原 saveOutline 最重要的一步）
     for (const chapter of normalized.chapters) {
@@ -532,7 +534,7 @@ async function cmdOutline(id) {
     const fixed = await fixLazyTitles(project.id, settingsObj);
     if (fixed > 0) ok(`已补全 ${fixed} 章偷懒标题`);
 
-    info(`下一步: xiaoshuo outline-confirm ${project.id.slice(0, 8)}`);
+    info(`✓ 已进入可写作状态，可直接运行 xiaoshuo write <id> <章号>`);
   }
 }
 
@@ -544,11 +546,11 @@ async function cmdWrite(id, num) {
   const chapter = db.getChapter(project.id, Number(num));
   if (!chapter) return err(`第 ${num} 章不存在，请先生成大纲`);
 
-  // 状态机预检：进入写作必须已准备好（outline 确认过或已在写）
+  // 状态机预检：进入写作必须已准备好（outline 完成 或 正在写）
   // 使用 canTransition 而不是硬编码 ready/writing——状态机代码以后改、调用点自动跟着动。
   if (!canTransitionToWrite(project.status)) {
     const desc = describeState(project.status);
-    return warn(`作品状态为 ${project.status}（${desc.label}），请先运行 xiaoshuo outline-confirm 确认大纲`);
+    return warn(`作品状态为 ${project.status}（${desc.label}），请先运行 xiaoshuo outline 生成大纲`);
   }
 
   const settingsObj = loadSettings();
@@ -749,10 +751,14 @@ async function main() {
       case 'outline-confirm':
         if (!positional[0]) return usage();
         {
+          // 纯校验：检查大纲是否已生成。不再改 status（现在 outline 完成自动切 ready）。
+          // 保留这个命令是向后兼容老用户 / 也可手动补调。
           const project = findProject(positional[0]);
-          if (project) {
-            db.updateProject(project.id, { status: 'ready' });
-            ok(`《${project.title}》已进入可写作状态`);
+          if (!project) return err(`未找到作品: ${positional[0]}`);
+          if (project.outline_json) {
+            ok(`《${project.title}》大纲已就绪（状态: ${project.status}），可直接运行 xiaoshuo write`);
+          } else {
+            return warn(`《${project.title}》尚未生成大纲，请先运行 xiaoshuo outline ${project.id.slice(0, 8)}`);
           }
         }
         break;
