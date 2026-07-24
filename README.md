@@ -48,12 +48,13 @@ xiaoshuo config
 
 ```bash
 xiaoshuo list                                # 列出所有作品
-xiaoshuo new -t "剑破苍穹" -g 玄幻 -c 100   # 新建作品（也可 xiaoshuo new 交互式）
+xiaoshuo new -t "剑破苍穹" -g 玄幻 -c 100 -e "主角是..."  # 新建作品（含附加设定）
 xiaoshuo show <id>                           # 查看详情
 xiaoshuo outline <id>                        # 生成大纲（异步轮询进度）
 xiaoshuo outline-confirm <id>                # 确认大纲，进入可写作状态
 xiaoshuo write <id> 1                        # 写第 1 章（流式打印）
 xiaoshuo continue <id>                       # 连续写完剩余章节
+xiaoshuo regenerate <id> <起始章> <新章数>   # 重规划后续大纲
 xiaoshuo derive <id> --mode sequel           # 衍生续作
 xiaoshuo derive <id> --mode template         # 复用模板
 xiaoshuo export <id> > 《剑破苍穹》.txt      # 导出 TXT
@@ -62,16 +63,28 @@ xiaoshuo delete <id>                         # 删除作品
 
 ## 写作流程（与原网页版一致）
 
-1. 输入书名 / 类型 / 主题 / 章数 / 每章字数 / 文风
+1. 输入书名 / 类型 / 主题 / 章数 / 每章字数 / 文风 / **附加设定（`-e`）**
 2. 生成世界设定、主要人物、时间线、大体剧情与逐章大纲
 3. 确认大纲后进入写作台
 4. 逐章生成或连续写作
 5. 完成后导出 TXT
 
+### `-e` 附加设定用法
+
+`-e` / `--extra` / `--prompt` 三种写法等价，把完整创意 prompt 传给 LLM：
+
+```bash
+xiaoshuo new -t "秘卷的短途" -g 东方玄幻 -c 3 \
+  -e "主角是一只成了精的白猫，住在现代上海，会写 Python 脚本，
+      一次接单遇到用易经 64 卦写的祖传代码。"
+```
+
+不传 `-e` 时，模型按 genre/theme 模板自由发挥；传了之后 LLM 会按 prompt 走。
+
 ## 核心特性（沿用原作者）
 
 - ✅ 单部作品最多 1000 章
-- ✅ 超过 50 章自动按 20 章/批生成大纲，断点续传
+- ✅ 超过 10 章自动按 10 章/批生成大纲，断点续传（README 之前误写"50/20"已修正）
 - ✅ 模型返回 JSON 自动修复（`jsonrepair` 兜底）
 - ✅ 4 层滚动记忆（全局摘要 / 最近摘要 / 章末原文 / 结构化记忆）
 - ✅ 流式 SSE 输出（SSE → CLI 实时打印）

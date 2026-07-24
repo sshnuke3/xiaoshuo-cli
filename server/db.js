@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import { canTransition } from './state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const databasePath = process.env.DATABASE_PATH
@@ -136,6 +137,26 @@ export function updateProject(id, fields) {
   }
   if (!sets.length) return getProject(id);
   sets.push(`updated_at = datetime('now')`);
+
+  // 状态机守卫：
+  // - 默认（推荐）：严格模式，非法状态转换抛错中断执行，避免后续不可预期的行为。
+  // - 环境变量 XIAOSHUO_STRICT_STATE=warn：退回 warn-only 模式，仅 console.warn 不抛错。
+  // - 环境变量 XIAOSHUO_STRICT_STATE=0：完全关闭守卫（紧急 disable 用）。
+  //
+  // 设计哲学：状态机的本来价值是约束。默认约束 = 极端时刻难用追查；
+  // 默认宽松 = warn 日志变成噪音、bug 被静默掩盖。选前者。
+  if (fields.status !== undefined && process.env.XIAOSHUO_STRICT_STATE !== '0') {
+    const current = db.prepare('SELECT status FROM projects WHERE id = ?').get(id);
+    if (current && current.status && !canTransition(current.status, fields.status)) {
+      const msg = `[state-guard] 项目 ${id.slice(0, 8)} 状态 ${current.status} → ${fields.status} 不在合法转换表里`;
+      if (process.env.XIAOSHUO_STRICT_STATE === 'warn') {
+        console.warn(`\x1b[33m${msg}\x1b[0m`);
+      } else {
+        throw new Error(msg);
+      }
+    }
+  }
+
   db.prepare(`UPDATE projects SET ${sets.join(', ')} WHERE id = @id`).run(params);
   return getProject(id);
 }

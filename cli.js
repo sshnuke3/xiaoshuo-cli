@@ -30,6 +30,12 @@ import {
   regenerateContinuationOutline,
   writeChapter,
 } from './server/context.js';
+import { describeState, phaseProgress, STATES, canTransition } from './server/state.js';
+
+// 写作可期的状态集合：已确认大纲（ready） 或 正在写（writing） 或 已完结可续写（completed）
+function canTransitionToWrite(currentStatus) {
+  return canTransition(currentStatus, 'writing');
+}
 
 const C = {
   reset: '\x1b[0m',
@@ -93,9 +99,10 @@ function usage() {
 ${C.bold}用法:${C.reset}
   xiaoshuo list                                列出所有作品
   xiaoshuo config                              配置 LLM（交互式）
-  xiaoshuo new [-t 标题] [-g 类型] [-c 章数]   新建作品
+  xiaoshuo new [-t 标题] [-g 类型] [-c 章数] [-e 附加设定]   新建作品
   xiaoshuo show <id>                           显示作品详情
   xiaoshuo outline <id>                        生成大纲
+  xiaoshuo outline-confirm <id>                确认大纲，进入可写作状态
   xiaoshuo write <id> <章号>                   写指定章节
   xiaoshuo continue <id> [起始章]              从某章连续写到结尾
   xiaoshuo regenerate <id> <起始章> <新章数>    重规划后续大纲
@@ -304,6 +311,17 @@ function cmdShow(id) {
   const project = findProject(id);
   if (!project) return err(`未找到作品: ${id}`);
   head(`作品详情: 《${project.title}》`);
+
+  // 阶段进度条：6 个 phase（draft / planning / planning_failed / ready / writing / completed）
+  const progress = phaseProgress(project.status);
+  const phaseLabels = STATES.map((s, i) => {
+    const icon = i < progress ? `${C.green}✓${C.reset}` : i === progress ? `${C.yellow}●${C.reset}` : `${C.dim}○${C.reset}`;
+    return `${icon}${s}`;
+  });
+  console.log(`  ${C.dim}阶段进度:${C.reset} ${phaseLabels.join(' ')}`);
+  const desc = describeState(project.status);
+  console.log(`  ${C.dim}当前阶段:${C.reset} ${C.bold}${project.status}${C.reset} — ${desc.label} | ${C.dim}${desc.next}${C.reset}`);
+
   const fields = [
     ['ID', project.id],
     ['类型', project.genre],
@@ -348,7 +366,7 @@ async function cmdNew(flags) {
     chapterCount = Number(flags.c || flags.chapters || 30);
     wordsPerChapter = Number(flags.w || flags.words || 2000);
     style = flags.s || flags.style || '通俗流畅';
-    extra = flags.extra || '';
+    extra = flags.extra || flags.e || flags.prompt || '';
   } else {
     const readline = await import('node:readline/promises');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -526,8 +544,11 @@ async function cmdWrite(id, num) {
   const chapter = db.getChapter(project.id, Number(num));
   if (!chapter) return err(`第 ${num} 章不存在，请先生成大纲`);
 
-  if (!['ready', 'writing'].includes(project.status)) {
-    return warn(`作品状态为 ${project.status}，请先运行 xiaoshuo outline-confirm 确认大纲`);
+  // 状态机预检：进入写作必须已准备好（outline 确认过或已在写）
+  // 使用 canTransition 而不是硬编码 ready/writing——状态机代码以后改、调用点自动跟着动。
+  if (!canTransitionToWrite(project.status)) {
+    const desc = describeState(project.status);
+    return warn(`作品状态为 ${project.status}（${desc.label}），请先运行 xiaoshuo outline-confirm 确认大纲`);
   }
 
   const settingsObj = loadSettings();
